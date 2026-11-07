@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""
+Universal App & Residual Uninstaller for Ubuntu
+===============================================
+A unified uninstaller that searches, detects, and cleanly purges applications across:
+  - APT / Dpkg packages (with config purge & orphaned dependency cleanup)
+  - Canonical Snap packages (with --purge)
+  - Flatpak applications (with --delete-data and runtime cleanup)
+  - Custom / Standalone Apps & AppImages (removes binaries, launchers, & icons)
+  - Deep residue sweep: cleans ~/.config, ~/.cache, ~/.local/share, ~/.var/app, ~/snap
+"""
+
+import os
+import sys
+import shutil
+import subprocess
+from pathlib import Path
+
+# ANSI colors
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+CYAN = "\033[96m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+
+# Protection for essential Ubuntu system packages
+PROTECTED_PACKAGES = {
+    "systemd", "systemd-sysv", "udev", "libc6", "linux-image-generic",
+    "ubuntu-desktop", "ubuntu-desktop-minimal", "gnome-shell", "xorg",
+    "sudo", "apt", "dpkg", "bash", "coreutils", "login", "init", "grub-pc",
+    "grub-efi-amd64", "dbus", "snapd"
+}
+
+def is_cmd_available(cmd):
+    return shutil.which(cmd) is not None
+
+def run_cmd(cmd_list, capture=True):
+    try:
+        return subprocess.run(
+            cmd_list,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+            text=True,
+            check=False
+        )
+    except Exception:
+        return None
+
+def is_managed_by_dpkg(file_path):
+    res = run_cmd(["dpkg", "-S", str(file_path)])
+    return res and res.returncode == 0
+
+def search_snaps(query):
+    if not is_cmd_available("snap"):
+        return []
+    res = run_cmd(["snap", "list"])
+    if not res or res.returncode != 0:
+        return []
+
+    matches = []
+    lines = res.stdout.strip().split("\n")
+    if len(lines) > 1:
+        for line in lines[1:]:
+            parts = line.split()
+            if not parts:
+                continue
+            name = parts[0]
+            version = parts[1] if len(parts) > 1 else ""
+            notes = " ".join(parts[2:]) if len(parts) > 2 else ""
+            if not query or query.lower() in name.lower():
+                matches.append({
+                    "source": "snap",
+                    "id": name,
+                    "name": name,
+                    "version": version,
+                    "details": f"Snap package ({notes.strip()})",
+                    "removable_paths": [],
+                    "protected": name in ("snapd", "bare", "core20", "core22", "core24")
+                })
+    return matches
+
+def search_flatpaks(query):
+    if not is_cmd_available("flatpak"):
+        return []
+    res = run_cmd(["flatpak", "list", "--app", "--columns=application,name,version,origin"])
+    if not res or res.returncode != 0:
+        return []
+
+    matches = []
+    for line in res.stdout.strip().split("\n"):
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            app_id = parts[0].strip()
+            app_name = parts[1].strip()
+            version = parts[2].strip() if len(parts) > 2 else ""
+            origin = parts[3].strip() if len(parts) > 3 else ""
+            search_str = f"{app_id} {app_name}".lower()
+            if not query or query.lower() in search_str:
+                matches.append({
+                    "source": "flatpak",
+                    "id": app_id,
+                    "name": app_name or app_id,
+                    "version": version,
+                    "details": f"Flatpak ({origin}) - ID: {app_id}",
+                    "removable_paths": [],
+                    "protected": False
+                })
+    return matches
+
+def search_apt(query):
+    if not query:
+        return []
+    if not is_cmd_available("dpkg-query"):
+        return []
+
+    res = run_cmd(["dpkg-query", "-W", "-f=${binary:Package}\t${Version}\t${Status}\n", f"*{query}*"])
+    matches = []
+    if res and res.returncode == 0:
+        for line in res.stdout.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                pkg = parts[0]
+                version = parts[1]
+                status = parts[2]
+                if "install ok installed" in status:
+                    is_prot = (pkg in PROTECTED_PACKAGES) or (pkg.split(":")[0] in PROTECTED_PACKAGES)
+                    matches.append({
+                        "source": "apt",
+                        "id": pkg,
+                        "name": pkg,
+                        "version": version,
+                        "details": f"APT/deb package ({version})",
+                        "removable_paths": [],
+                        "protected": is_prot
+                    })
+    return matches
+
+def parse_desktop_file(filepath):
+    try:
+        content = filepath.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+
+    name = None
+    exec_cmd = None
+    icon = None
+    no_display = False
+
+    for line in content.splitlines():
+        line = line.strip()
+        if line.startswith("Name=") and name is None:
+            name = line.split("=", 1)[1]
+        elif line.startswith("Exec=") and exec_cmd is None:
+            exec_cmd = line.split("=", 1)[1]
+        elif line.startswith("Icon=") and icon is None:
+            icon = line.split("=", 1)[1]
+        elif line.startswith("NoDisplay="):
+            val = line.split("=", 1)[1].lower()
+            if val == "true":
+                no_display = True
+
+    if not name or not exec_cmd or no_display:
+        return None
+
+    raw_exec = exec_cmd.split()[0].strip('"\'')
+    exec_path = None
+    if os.path.isabs(raw_exec):
+        exec_path = Path(raw_exec)
+    else:
+        which_path = shutil.which(raw_exec)
+        if which_path:
+            exec_path = Path(which_path)
+
+    return {
+        "name": name,
+        "exec_cmd": exec_cmd,
+        "exec_path": exec_path,
+        "icon": icon,
+        "desktop_file": filepath
+    }
+
+def search_custom_apps(query):
+    results = []
+    desktop_dirs = [
+        Path.home() / ".local/share/applications",
+        Path("/usr/local/share/applications"),
+        Path("/usr/share/applications")
+    ]
+
+    seen_desktop_names = set()
+
+    for d in desktop_dirs:
+        if not d.exists():
+            continue
+        for desktop_file in d.glob("*.desktop"):
+            data = parse_desktop_file(desktop_file)
+            if not data:
+                continue
+
+            if data["name"] in seen_desktop_names:
+                continue
+
+            search_corpus = f"{data['name']} {desktop_file.name} {data['exec_cmd']}".lower()
+            if query and query.lower() not in search_corpus:
+                continue
+
+            exec_path = data["exec_path"]
+            desktop_path = data["desktop_file"]
+
+            # Filter out entries handled by Flatpak or Snap
+            if "/var/lib/flatpak" in str(desktop_path) or "/var/lib/snapd" in str(desktop_path) or "/snap/" in str(desktop_path):
+                continue
+
+            is_custom = False
+            associated_paths = [desktop_path]
+
+            if str(desktop_path).startswith(str(Path.home())):
+                is_custom = True
+            elif exec_path:
+                if str(exec_path).startswith(str(Path.home())):
+                    is_custom = True
+                elif "/opt/" in str(exec_path) or "/usr/local/" in str(exec_path):
+                    if not is_managed_by_dpkg(desktop_path):
+                        is_custom = True
+                elif not is_managed_by_dpkg(desktop_path) and not is_managed_by_dpkg(exec_path):
+                    is_custom = True
+
+            if is_custom:
+                seen_desktop_names.add(data["name"])
+                if exec_path and exec_path.exists():
+                    if str(exec_path).lower().endswith(".appimage"):
+                        associated_paths.append(exec_path)
+                    elif "/opt/" in str(exec_path):
+                        parts = exec_path.parts
+                        if len(parts) >= 3 and parts[1] == "opt":
+                            app_opt_dir = Path("/opt") / parts[2]
+                            if app_opt_dir.exists() and not is_managed_by_dpkg(app_opt_dir):
+                                associated_paths.append(app_opt_dir)
+                            else:
+                                associated_paths.append(exec_path)
+                        else:
+                            associated_paths.append(exec_path)
+                    elif str(exec_path).startswith(str(Path.home())):
+                        associated_paths.append(exec_path)
+
+                # Find custom icons if in ~/.local/share/icons
+                if data.get("icon") and not data["icon"].startswith("/"):
+                    icon_path = Path.home() / f".local/share/icons/{data['icon']}.png"
+                    if icon_path.exists():
+                        associated_paths.append(icon_path)
+
+                results.append({
+                    "source": "custom",
+                    "id": str(desktop_path),
+                    "name": data["name"],
+                    "version": "Custom / Standalone",
+                    "details": f"Launcher: {desktop_path.name} (Exec: {exec_path or data['exec_cmd']})",
+                    "removable_paths": associated_paths,
+                    "protected": False
+                })
+
+    return results
+
+def find_residual_data(app_name, app_id=None):
+    """Deep scan for config, cache, and runtime directories matching the app."""
+    candidates = set()
+    patterns = {app_name.lower().replace(" ", "-"), app_name.lower().replace(" ", ""), app_name.lower()}
+
+    if app_id:
+        patterns.add(app_id.lower())
+        parts = app_id.lower().split(".")
+        if len(parts) > 1:
+            patterns.add(parts[-1])
+
+    search_roots = [
+        Path.home() / ".config",
+        Path.home() / ".cache",
+        Path.home() / ".local/share",
+        Path.home() / ".var/app",
+        Path.home() / "snap"
+    ]
+
+    for root in search_roots:
+        if not root.exists():
+            continue
+        try:
+            for item in root.iterdir():
+                item_name = item.name.lower()
+                for pat in patterns:
+                    if len(pat) >= 3:
+                        if item_name == pat or item_name.startswith(pat + "-") or item_name.startswith(pat + "."):
+                            candidates.add(item)
+        except (PermissionError, FileNotFoundError):
+            continue
+
+    return sorted(list(candidates))
+
+def get_dir_size(path):
+    total = 0
+    try:
+        if path.is_file():
+            return path.stat().st_size
+        for entry in path.rglob("*"):
+            if entry.is_file() and not entry.is_symlink():
+                total += entry.stat().st_size
+    except Exception:
+        pass
+    return total
+
+def format_size(bytes_size):
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if bytes_size < 1024.0:
+            return f"{bytes_size:.1f} {unit}"
+        bytes_size /= 1024.0
+    return f"{bytes_size:.1f} TB"
+
+def print_banner():
+    print(f"\n{BOLD}{CYAN}======================================================================{RESET}")
+    print(f"{BOLD}{CYAN}          UNIVERSAL UBUNTU APPLICATION & RESIDUE UNINSTALLER          {RESET}")
+    print(f"{BOLD}{CYAN}======================================================================{RESET}")
+    print(f"{DIM}Sources: APT/Deb | Snap | Flatpak | AppImage | Custom Standalone Apps{RESET}\n")
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Universal Uninstaller for Ubuntu: Removes applications across APT, Snap, Flatpak, and Custom Standalone/AppImages along with all residual data."
+    )
+    parser.add_argument("query", nargs="?", default="", help="Name or keyword of the application to search and uninstall")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate uninstallation without modifying any files")
+    parser.add_argument("--force-system", action="store_true", help="Allow removing protected system packages (DANGEROUS)")
+    args = parser.parse_args()
+
+    print_banner()
+
+    query = args.query.strip()
+    if not query:
+        try:
+            query = input(f"{BOLD}Enter application name or keyword to search: {RESET}").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nAborted.")
+            sys.exit(0)
+
+    if not query:
+        print(f"{RED}No search query provided. Exiting.{RESET}")
+        sys.exit(1)
+
+    print(f"{YELLOW}Searching across package managers and custom sources for '{query}'...{RESET}\n")
+
+    snaps = search_snaps(query)
+    flatpaks = search_flatpaks(query)
+    customs = search_custom_apps(query)
+    apts = search_apt(query)
+
+    all_results = snaps + flatpaks + customs + apts
+
+    if not all_results:
+        print(f"{RED}No matching applications found for '{query}'.{RESET}")
+        print("Tip: Check spelling or try a shorter substring (e.g. 'discord', 'code', 'vlc').")
+        sys.exit(0)
+
+    print(f"{BOLD}Found {len(all_results)} match(es):{RESET}\n")
+    for idx, item in enumerate(all_results, 1):
+        source_badge = {
+            "apt": f"{BLUE}[APT/DEB]{RESET}",
+            "snap": f"{CYAN}[SNAP]{RESET}",
+            "flatpak": f"{GREEN}[FLATPAK]{RESET}",
+            "custom": f"{MAGENTA}[CUSTOM/APPIMAGE]{RESET}"
+        }.get(item["source"], "[OTHER]")
+
+        prot_warn = f" {RED}{BOLD}[CRITICAL SYSTEM PACKAGE]{RESET}" if item.get("protected") else ""
+        print(f"  {BOLD}[{idx}]{RESET} {source_badge} {BOLD}{item['name']}{RESET}{prot_warn}")
+        print(f"      ID: {item['id']}")
+        print(f"      Info: {item['details']}")
+        if item.get("removable_paths"):
+            for p in item["removable_paths"]:
+                print(f"      Path: {p}")
+        print()
+
+    # User selection
+    try:
+        choice = input(f"{BOLD}Select app number to uninstall (1-{len(all_results)}, comma-separated, 'all', or 'q' to quit): {RESET}").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\nAborted.")
+        sys.exit(0)
+
+    if choice.lower() in ['q', 'quit', 'exit', '']:
+        print("Operation cancelled.")
+        sys.exit(0)
+
+    selected_items = []
+    if choice.lower() == 'all':
+        selected_items = all_results
+    else:
+        try:
+            indexes = [int(x.strip()) for x in choice.split(",") if x.strip()]
+            for i in indexes:
+                if 1 <= i <= len(all_results):
+                    selected_items.append(all_results[i-1])
+                else:
+                    print(f"{RED}Warning: Index {i} out of bounds.{RESET}")
+        except ValueError:
+            print(f"{RED}Invalid selection.{RESET}")
+            sys.exit(1)
+
+    if not selected_items:
+        print("No valid apps selected.")
+        sys.exit(0)
+
+    # Process selections
+    for item in selected_items:
+        print(f"\n{BOLD}{CYAN}----------------------------------------------------------------------{RESET}")
+        print(f"Preparing to uninstall: {BOLD}{item['name']}{RESET} ({item['source'].upper()})")
+        print(f"{BOLD}{CYAN}----------------------------------------------------------------------{RESET}")
+
+        if item.get("protected") and not args.force_system:
+            print(f"{RED}{BOLD}ERROR: '{item['name']}' is marked as a critical system component!{RESET}")
+            print("Purging this package may break Ubuntu system stability.")
+            print("Skipping. (Pass --force-system if you are completely sure).")
+            continue
+
+        if args.dry_run:
+            print(f"{YELLOW}[DRY-RUN] Would remove application {item['name']} ({item['source']}){RESET}")
+            if item.get("removable_paths"):
+                for p in item["removable_paths"]:
+                    print(f"  [DRY-RUN] Would delete: {p}")
+        else:
+            if item["source"] == "snap":
+                cmd = ["sudo", "snap", "remove", "--purge", item["id"]]
+                print(f"Executing: {BOLD}{' '.join(cmd)}{RESET}")
+                subprocess.run(cmd)
+
+            elif item["source"] == "flatpak":
+                cmd = ["flatpak", "uninstall", "--delete-data", "-y", item["id"]]
+                print(f"Executing: {BOLD}{' '.join(cmd)}{RESET}")
+                subprocess.run(cmd)
+                print(f"{DIM}Cleaning unused flatpak runtimes...{RESET}")
+                run_cmd(["flatpak", "uninstall", "--unused", "-y"], capture=False)
+
+            elif item["source"] == "apt":
+                cmd = ["sudo", "apt", "purge", "-y", item["id"]]
+                print(f"Executing: {BOLD}{' '.join(cmd)}{RESET}")
+                subprocess.run(cmd)
+                print(f"{YELLOW}Cleaning unneeded package dependencies (autoremove --purge)...{RESET}")
+                subprocess.run(["sudo", "apt", "autoremove", "--purge", "-y"])
+
+            elif item["source"] == "custom":
+                paths = item.get("removable_paths", [])
+                print("Files & directories to be deleted:")
+                for p in paths:
+                    print(f"  - {p}")
+
+                confirm = input(f"\n{BOLD}Delete these custom files & directories? (y/N): {RESET}").strip().lower()
+                if confirm == 'y':
+                    for p in paths:
+                        try:
+                            p = Path(p)
+                            needs_sudo = not os.access(p.parent, os.W_OK)
+                            if needs_sudo:
+                                print(f"Removing (sudo): {p}")
+                                subprocess.run(["sudo", "rm", "-rf", str(p)])
+                            else:
+                                print(f"Removing: {p}")
+                                if p.is_dir():
+                                    shutil.rmtree(p, ignore_errors=True)
+                                elif p.exists():
+                                    p.unlink()
+                        except Exception as e:
+                            print(f"{RED}Error removing {p}: {e}{RESET}")
+
+                    # Refresh desktop database
+                    if is_cmd_available("update-desktop-database"):
+                        run_cmd(["update-desktop-database", str(Path.home() / ".local/share/applications")])
+
+        # Step 2: Residual Scan
+        print(f"\n{YELLOW}Scanning for leftover configs, caches, and application data...{RESET}")
+        residuals = find_residual_data(item["name"], item["id"])
+
+        if residuals:
+            print(f"{BOLD}Found {len(residuals)} residual directory/file(s):{RESET}")
+            for r in residuals:
+                size = format_size(get_dir_size(r))
+                print(f"  - {r} {CYAN}({size}){RESET}")
+
+            if args.dry_run:
+                print(f"{YELLOW}[DRY-RUN] Would prompt to delete these residual folders.{RESET}")
+            else:
+                res_confirm = input(f"\n{BOLD}Do you want to permanently delete these residual folders? (y/N): {RESET}").strip().lower()
+                if res_confirm == 'y':
+                    for r in residuals:
+                        try:
+                            if r.is_dir():
+                                shutil.rmtree(r, ignore_errors=True)
+                            else:
+                                r.unlink()
+                            print(f"  {GREEN}Deleted:{RESET} {r}")
+                        except Exception as e:
+                            print(f"  {RED}Failed to delete {r}: {e}{RESET}")
+        else:
+            print("No lingering config or cache folders detected.")
+
+        print(f"\n{GREEN}Done with {item['name']}!{RESET}")
+
+    print(f"\n{BOLD}{GREEN}✓ All operations finished successfully.{RESET}\n")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Universal App Uninstaller
+GenericName=Package & App Uninstaller
+Comment=Universal uninstaller for APT, Snap, Flatpak, and Custom AppImages with residue cleanup
+Exec=/home/rohan/.local/bin/uni-uninstaller-gui
+Icon=universal-uninstaller
+Terminal=false
+Categories=System;Utility;
+Keywords=uninstall;remove;purge;clean;stacer;flatpak;snap;apt;appimage;rea;
+StartupNotify=true
