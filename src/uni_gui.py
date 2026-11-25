@@ -7,11 +7,12 @@ Built with CustomTkinter & REA-style Binary Inspection
 import os
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox
 from pathlib import Path
 
-# Add scratch dir to path
+# Add scratch / repo dir to path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
@@ -24,6 +25,7 @@ import engine
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
+
 class UniversalUninstallerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -32,11 +34,25 @@ class UniversalUninstallerApp(ctk.CTk):
         self.geometry("1100x720")
         self.minsize(950, 600)
 
-        # Set window icon if exists
-        icon_path = Path.home() / ".local/share/icons/universal-uninstaller.png"
-        if icon_path.exists():
+        # Center main window on screen
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        ww, wh = 1100, 720
+        x = max(0, (sw - ww) // 2)
+        y = max(0, (sh - wh) // 2)
+        self.geometry(f"{ww}x{wh}+{x}+{y}")
+
+        # Hide main window initially while loading screen runs
+        self.withdraw()
+
+        # Resolve icon path
+        self.icon_path = Path.home() / ".local/share/icons/universal-uninstaller.png"
+        if not self.icon_path.exists():
+            self.icon_path = SCRIPT_DIR.parent / "assets" / "universal-uninstaller.png"
+
+        if self.icon_path.exists():
             try:
-                self.iconphoto(False, tk.PhotoImage(file=str(icon_path)))
+                self.iconphoto(False, tk.PhotoImage(file=str(self.icon_path)))
             except Exception:
                 pass
 
@@ -48,8 +64,166 @@ class UniversalUninstallerApp(ctk.CTk):
         self.cached_residuals = {}
         self.cached_rea_reports = {}
 
+        # Build main dashboard UI (in background while withdrawn)
         self.setup_ui()
-        self.refresh_apps()
+
+        # Display splash / loading screen and scan packages
+        self.show_splash_and_load()
+
+    def show_splash_and_load(self):
+        """Displays a sleek centered splash screen while scanning all app sources."""
+        self.splash = ctk.CTkToplevel()
+        self.splash.overrideredirect(True)
+
+        w, h = 520, 330
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+        self.splash.geometry(f"{w}x{h}+{x}+{y}")
+        self.splash.attributes("-topmost", True)
+
+        # Outer card with border
+        card = ctk.CTkFrame(
+            self.splash,
+            corner_radius=16,
+            fg_color="#0f172a",
+            border_width=2,
+            border_color="#0284c7"
+        )
+        card.pack(fill="both", expand=True, padx=2, pady=2)
+
+        # App Icon
+        if self.icon_path and self.icon_path.exists():
+            try:
+                pil_img = Image.open(str(self.icon_path))
+                self.splash_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(68, 68))
+                icon_lbl = ctk.CTkLabel(card, text="", image=self.splash_img)
+                icon_lbl.pack(pady=(26, 8))
+            except Exception:
+                icon_lbl = ctk.CTkLabel(card, text="[Uninstaller]", font=ctk.CTkFont(size=24, weight="bold"))
+                icon_lbl.pack(pady=(26, 8))
+        else:
+            icon_lbl = ctk.CTkLabel(card, text="[Uninstaller]", font=ctk.CTkFont(size=24, weight="bold"))
+            icon_lbl.pack(pady=(26, 8))
+
+        # Title
+        title_lbl = ctk.CTkLabel(
+            card,
+            text="Universal App Uninstaller",
+            font=ctk.CTkFont(size=20, weight="bold"),
+            text_color="#f8fafc"
+        )
+        title_lbl.pack(pady=(0, 2))
+
+        # Subtitle
+        sub_lbl = ctk.CTkLabel(
+            card,
+            text="APT • Snap • Flatpak • Custom AppImages • REA Engine",
+            font=ctk.CTkFont(size=11),
+            text_color="#94a3b8"
+        )
+        sub_lbl.pack(pady=(0, 22))
+
+        # Status text & percentage row
+        status_row = ctk.CTkFrame(card, fg_color="transparent")
+        status_row.pack(fill="x", padx=44, pady=(0, 6))
+
+        self.splash_status_lbl = ctk.CTkLabel(
+            status_row,
+            text="Initializing inspection engine...",
+            font=ctk.CTkFont(size=12),
+            text_color="#38bdf8",
+            anchor="w"
+        )
+        self.splash_status_lbl.pack(side="left")
+
+        self.splash_percent_lbl = ctk.CTkLabel(
+            status_row,
+            text="10%",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#94a3b8",
+            anchor="e"
+        )
+        self.splash_percent_lbl.pack(side="right")
+
+        # Progress bar
+        self.splash_progress = ctk.CTkProgressBar(
+            card,
+            width=432,
+            height=8,
+            corner_radius=4,
+            fg_color="#1e293b",
+            progress_color="#38bdf8"
+        )
+        self.splash_progress.set(0.1)
+        self.splash_progress.pack(pady=(0, 14))
+
+        # OS edition footer
+        footer_lbl = ctk.CTkLabel(
+            card,
+            text="Ubuntu Linux Edition • Scanning installed packages...",
+            font=ctk.CTkFont(size=10),
+            text_color="#64748b"
+        )
+        footer_lbl.pack(pady=(0, 14))
+
+        self.splash.update()
+
+        # Start loading worker thread
+        threading.Thread(target=self._startup_worker, daemon=True).start()
+
+    def _update_splash_step(self, status_text, progress_val):
+        """Updates status text and progress bar on the splash screen."""
+        try:
+            pct = int(progress_val * 100)
+            self.splash_status_lbl.configure(text=status_text)
+            self.splash_percent_lbl.configure(text=f"{pct}%")
+            self.splash_progress.set(progress_val)
+            self.splash.update_idletasks()
+        except Exception:
+            pass
+
+    def _startup_worker(self):
+        """Background worker that scans all sources and updates splash progress."""
+        time.sleep(0.1)
+
+        # Stage 1: Snap packages
+        self.after(0, lambda: self._update_splash_step("Scanning Canonical Snap packages...", 0.25))
+        snaps = engine.get_installed_snaps()
+
+        # Stage 2: Flatpaks
+        self.after(0, lambda: self._update_splash_step("Scanning Flatpak applications & runtimes...", 0.50))
+        flatpaks = engine.get_installed_flatpaks()
+
+        # Stage 3: Custom / AppImages
+        self.after(0, lambda: self._update_splash_step("Analyzing Custom Standalone Apps & AppImages...", 0.75))
+        customs = engine.get_installed_custom_apps()
+
+        # Stage 4: APT / Debian
+        self.after(0, lambda: self._update_splash_step("Scanning APT & Debian desktop applications...", 0.90))
+        apts = engine.get_installed_apt_apps()
+
+        # Stage 5: Finalizing
+        total_apps = customs + flatpaks + snaps + apts
+        self.after(0, lambda: self._update_splash_step(f"Ready! Loaded {len(total_apps)} applications.", 1.0))
+        time.sleep(0.2)
+
+        self.after(0, lambda: self._finish_startup(total_apps))
+
+    def _finish_startup(self, total_apps):
+        """Closes splash screen and reveals the ready main dashboard window."""
+        self.all_apps = total_apps
+        self.filter_and_render_list()
+
+        try:
+            self.splash.destroy()
+        except Exception:
+            pass
+
+        self.deiconify()
+        self.lift()
+        self.focus_force()
 
     def setup_ui(self):
         # Configure grid layout (1 row, 2 columns: left list, right inspector)
@@ -77,7 +251,7 @@ class UniversalUninstallerApp(ctk.CTk):
 
         self.refresh_btn = ctk.CTkButton(
             self.banner_frame,
-            text="⟳ Refresh",
+            text="Refresh",
             width=90,
             command=self.refresh_apps,
             fg_color="#334155",
@@ -91,7 +265,7 @@ class UniversalUninstallerApp(ctk.CTk):
 
         self.search_entry = ctk.CTkEntry(
             self.search_frame,
-            placeholder_text="🔍 Search apps by name, package ID, or keyword...",
+            placeholder_text="Search apps by name, package ID, or keyword...",
             font=ctk.CTkFont(size=13),
             height=36
         )
@@ -158,7 +332,7 @@ class UniversalUninstallerApp(ctk.CTk):
 
         self.placeholder_label = ctk.CTkLabel(
             self.details_scroll,
-            text="👈 Select an application from the list to inspect\nits binary architecture, installation footprint,\nand leftover configuration/cache files.",
+            text="Select an application from the list to inspect\nits binary architecture, installation footprint,\nand leftover configuration/cache files.",
             font=ctk.CTkFont(size=13),
             text_color="#94a3b8",
             justify="center"
@@ -171,7 +345,7 @@ class UniversalUninstallerApp(ctk.CTk):
 
         self.uninstall_btn = ctk.CTkButton(
             self.action_frame,
-            text="🗑 Uninstall & Clean Residue",
+            text="Uninstall & Clean Residue",
             height=40,
             font=ctk.CTkFont(size=14, weight="bold"),
             fg_color="#dc2626",
@@ -183,7 +357,7 @@ class UniversalUninstallerApp(ctk.CTk):
 
         self.clean_residuals_only_btn = ctk.CTkButton(
             self.action_frame,
-            text="🧹 Clean Residual Data Only",
+            text="Clean Residual Data Only",
             height=32,
             font=ctk.CTkFont(size=12),
             fg_color="#334155",
@@ -194,6 +368,7 @@ class UniversalUninstallerApp(ctk.CTk):
         self.clean_residuals_only_btn.configure(state="disabled")
 
     def refresh_apps(self):
+        """In-app manual refresh without hiding main window."""
         self.status_label.configure(text="Scanning all application sources...")
         self.refresh_btn.configure(state="disabled")
 
@@ -382,7 +557,7 @@ class UniversalUninstallerApp(ctk.CTk):
 
         rea_header = ctk.CTkLabel(
             rea_card,
-            text="🔬 REA Binary Architecture Analysis",
+            text="REA Binary Architecture Analysis",
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color="#38bdf8",
             anchor="w"
@@ -406,7 +581,7 @@ class UniversalUninstallerApp(ctk.CTk):
 
         res_header = ctk.CTkLabel(
             res_card,
-            text="🧹 Discovered Residual Folders (Config / Cache / Data)",
+            text="Discovered Residual Folders (Config / Cache / Data)",
             font=ctk.CTkFont(size=13, weight="bold"),
             anchor="w"
         )
@@ -438,7 +613,10 @@ class UniversalUninstallerApp(ctk.CTk):
         threading.Thread(target=inspect_worker, daemon=True).start()
 
     def update_inspector_results(self, app, rep, residuals, rea_info_lbl, res_card, res_loading_lbl):
-        res_loading_lbl.destroy()
+        try:
+            res_loading_lbl.destroy()
+        except Exception:
+            pass
 
         # Update REA text
         if rep:
@@ -484,7 +662,7 @@ class UniversalUninstallerApp(ctk.CTk):
         else:
             no_res_lbl = ctk.CTkLabel(
                 res_card,
-                text="✓ No residual config or cache folders detected.",
+                text="No residual config or cache folders detected.",
                 font=ctk.CTkFont(size=11),
                 text_color="#10b981",
                 anchor="w"
@@ -590,16 +768,18 @@ class UniversalUninstallerApp(ctk.CTk):
             for a in apps:
                 res = residuals_map.get(a["id"], [])
                 engine.execute_uninstallation(a, res, progress_callback=log_cb)
-            log_cb("\n✓ All requested uninstallations completed successfully!")
+            log_cb("\nAll requested uninstallations completed successfully!")
             self.batch_selected_ids.clear()
             self.batch_uninstall_btn.configure(text="Uninstall Selected (0)")
             close_btn.configure(state="normal")
 
         threading.Thread(target=run_all, daemon=True).start()
 
+
 def main():
     app = UniversalUninstallerApp()
     app.mainloop()
+
 
 if __name__ == "__main__":
     main()
