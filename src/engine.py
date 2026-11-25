@@ -252,7 +252,20 @@ def get_installed_flatpaks():
             })
     return flatpaks
 
-def get_installed_custom_apps():
+def get_dpkg_desktop_map():
+    """Returns a dict mapping desktop file paths to their package name in a single batch query."""
+    res = run_cmd(["dpkg", "-S", "/usr/share/applications/*.desktop"])
+    if not res or res.returncode != 0:
+        return {}
+    desktop_to_pkg = {}
+    for line in res.stdout.strip().splitlines():
+        if ": " in line:
+            pkg, path = line.split(": ", 1)
+            pkg = pkg.split(":")[0].strip()
+            desktop_to_pkg[path.strip()] = pkg
+    return desktop_to_pkg
+
+def get_installed_custom_apps(dpkg_desktop_map=None):
     apps = []
     desktop_dirs = [
         Path.home() / ".local/share/applications",
@@ -261,16 +274,20 @@ def get_installed_custom_apps():
     ]
 
     seen = set()
+    if dpkg_desktop_map is None:
+        dpkg_desktop_map = get_dpkg_desktop_map()
 
     for d in desktop_dirs:
         if not d.exists():
             continue
+        is_usr_share = (str(d) == "/usr/share/applications")
         for df in sorted(d.glob("*.desktop")):
-            data = parse_desktop_file(df)
-            if not data:
+            # If in /usr/share/applications and managed by dpkg, skip (it's an APT app)
+            if is_usr_share and str(df) in dpkg_desktop_map:
                 continue
 
-            if data["name"] in seen:
+            data = parse_desktop_file(df)
+            if not data or data["name"] in seen:
                 continue
 
             exec_path = data["exec_path"]
@@ -280,81 +297,54 @@ def get_installed_custom_apps():
             if "/var/lib/flatpak" in str(desktop_path) or "/var/lib/snapd" in str(desktop_path) or "/snap/" in str(desktop_path):
                 continue
 
-            is_custom = False
+            seen.add(data["name"])
             associated = [desktop_path]
 
-            if str(desktop_path).startswith(str(Path.home())):
-                is_custom = True
-            elif exec_path:
-                if str(exec_path).startswith(str(Path.home())):
-                    is_custom = True
-                elif "/opt/" in str(exec_path) or "/usr/local/" in str(exec_path):
-                    if not is_managed_by_dpkg(desktop_path):
-                        is_custom = True
-                elif not is_managed_by_dpkg(desktop_path) and not is_managed_by_dpkg(exec_path):
-                    is_custom = True
-
-            if is_custom:
-                seen.add(data["name"])
-                if exec_path and exec_path.exists():
-                    if str(exec_path).lower().endswith(".appimage"):
-                        associated.append(exec_path)
-                    elif "/opt/" in str(exec_path):
-                        parts = exec_path.parts
-                        if len(parts) >= 3 and parts[1] == "opt":
-                            app_opt = Path("/opt") / parts[2]
-                            if app_opt.exists() and not is_managed_by_dpkg(app_opt):
-                                associated.append(app_opt)
-                            else:
-                                associated.append(exec_path)
+            if exec_path and exec_path.exists():
+                if str(exec_path).lower().endswith(".appimage"):
+                    associated.append(exec_path)
+                elif "/opt/" in str(exec_path):
+                    parts = exec_path.parts
+                    if len(parts) >= 3 and parts[1] == "opt":
+                        app_opt = Path("/opt") / parts[2]
+                        if app_opt.exists():
+                            associated.append(app_opt)
                         else:
                             associated.append(exec_path)
-                    elif str(exec_path).startswith(str(Path.home())):
+                    else:
                         associated.append(exec_path)
+                elif str(exec_path).startswith(str(Path.home())):
+                    associated.append(exec_path)
 
-                # Icon check
-                if data.get("icon") and not data["icon"].startswith("/"):
-                    icon_path = Path.home() / f".local/share/icons/{data['icon']}.png"
-                    if icon_path.exists():
-                        associated.append(icon_path)
+            # Icon check
+            if data.get("icon") and not data["icon"].startswith("/"):
+                icon_path = Path.home() / f".local/share/icons/{data['icon']}.png"
+                if icon_path.exists():
+                    associated.append(icon_path)
 
-                apps.append({
-                    "source": "Custom",
-                    "id": str(desktop_path),
-                    "name": data["name"],
-                    "version": "Standalone",
-                    "details": data["comment"] or f"Launcher: {desktop_path.name}",
-                    "binary_path": str(exec_path) if exec_path else None,
-                    "removable_paths": associated,
-                    "protected": False
-                })
+            apps.append({
+                "source": "Custom",
+                "id": str(desktop_path),
+                "name": data["name"],
+                "version": "Standalone",
+                "details": data["comment"] or f"Launcher: {desktop_path.name}",
+                "binary_path": str(exec_path) if exec_path else None,
+                "removable_paths": associated,
+                "protected": False
+            })
 
     return apps
 
-def get_installed_apt_apps():
+def get_installed_apt_apps(dpkg_desktop_map=None):
     """Returns top-level installed APT applications that have desktop entries."""
     if not is_cmd_available("dpkg-query"):
         return []
 
-    desktop_dir = Path("/usr/share/applications")
-    if not desktop_dir.exists():
-        return []
-
-    # Run dpkg -S in a single batch for all desktop files
-    res = run_cmd(["dpkg", "-S", "/usr/share/applications/*.desktop"])
-    if not res or res.returncode != 0:
-        return []
-
-    desktop_to_pkg = {}
-    for line in res.stdout.strip().splitlines():
-        if ": " in line:
-            pkg, path = line.split(": ", 1)
-            # handle multiarch pkg:amd64
-            pkg = pkg.split(":")[0].strip()
-            desktop_to_pkg[path.strip()] = pkg
+    if dpkg_desktop_map is None:
+        dpkg_desktop_map = get_dpkg_desktop_map()
 
     pkgs = {}
-    for path_str, pkg in desktop_to_pkg.items():
+    for path_str, pkg in dpkg_desktop_map.items():
         if pkg not in pkgs:
             p = Path(path_str)
             data = parse_desktop_file(p)
